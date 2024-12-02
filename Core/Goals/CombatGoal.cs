@@ -109,8 +109,8 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
         if (bits.Target_Dead())
         {
             // sometimes the combat can be stuck on a dead target
+            // clear target and move on
             input.PressClearTarget();
-            FindNewTarget();
         }
         if (MathF.Abs(lastDirection - playerReader.Direction) > MathF.PI / 2)
         {
