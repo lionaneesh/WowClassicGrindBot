@@ -48,7 +48,7 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
 
         AddPrecondition(GoapKey.incombat, true);
         AddPrecondition(GoapKey.hastarget, true);
-        AddPrecondition(GoapKey.targetisalive, true);
+        //AddPrecondition(GoapKey.targetisalive, true);
         AddPrecondition(GoapKey.targethostile, true);
         //AddPrecondition(GoapKey.targettargetsus, true);
         AddPrecondition(GoapKey.incombatrange, true);
@@ -106,7 +106,12 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
     public override void Update()
     {
         wait.Update();
-
+        if (bits.Target_Dead())
+        {
+            // sometimes the combat can be stuck on a dead target
+            input.PressClearTarget();
+            FindNewTarget();
+        }
         if (MathF.Abs(lastDirection - playerReader.Direction) > MathF.PI / 2)
         {
             logger.LogInformation("Turning too fast!");
@@ -125,6 +130,7 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
 
         if (bits.Target())
         {
+            if (bits.TargetDead()) {
             if (classConfig.AutoPetAttack &&
                 bits.Pet() &&
                 (!playerReader.PetTarget() || playerReader.PetTargetGuid != playerReader.TargetGuid) &&
