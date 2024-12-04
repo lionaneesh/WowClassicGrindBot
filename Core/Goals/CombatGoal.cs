@@ -3,32 +3,41 @@
 using Microsoft.Extensions.Logging;
 
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Numerics;
+using System.Threading;
+using static System.MathF;
 
 namespace Core.Goals;
 
 public sealed class CombatGoal : GoapGoal, IGoapEventListener
 {
     public override float Cost => 4f;
+    public DateTime LastSafeLocationTime = new DateTime();
+    Queue safeLocations = new Queue();
+
 
     private readonly ILogger<CombatGoal> logger;
     private readonly ConfigurableInput input;
     private readonly ClassConfiguration classConfig;
     private readonly Wait wait;
+    private readonly Navigation playerNavigation;
     private readonly PlayerReader playerReader;
     private readonly AddonBits bits;
     private readonly StopMoving stopMoving;
     private readonly CastingHandler castingHandler;
     private readonly IMountHandler mountHandler;
     private readonly CombatLog combatLog;
-
+    private const float minAngleToTurn = PI / 35f;              // 5.14 degree
+    private const float minAngleToStopBeforeTurn = PI / 2f;     // 90 degree
     private float lastDirection;
     private float lastMinDistance;
     private float lastMaxDistance;
 
     public CombatGoal(ILogger<CombatGoal> logger, ConfigurableInput input,
         Wait wait, PlayerReader playerReader, StopMoving stopMoving, AddonBits bits,
-        ClassConfiguration classConfiguration, ClassConfiguration classConfig,
+        Navigation playerNavigation, ClassConfiguration classConfiguration, ClassConfiguration classConfig,
         CastingHandler castingHandler, CombatLog combatLog,
         IMountHandler mountHandler)
         : base(nameof(CombatGoal))
@@ -40,6 +49,7 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
         this.playerReader = playerReader;
         this.bits = bits;
         this.combatLog = combatLog;
+        this.playerNavigation = playerNavigation;
 
         this.stopMoving = stopMoving;
         this.castingHandler = castingHandler;
@@ -48,7 +58,7 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
 
         AddPrecondition(GoapKey.incombat, true);
         AddPrecondition(GoapKey.hastarget, true);
-        AddPrecondition(GoapKey.targetisalive, true);
+        //AddPrecondition(GoapKey.targetisalive, true);
         AddPrecondition(GoapKey.targethostile, true);
         //AddPrecondition(GoapKey.targettargetsus, true);
         AddPrecondition(GoapKey.incombatrange, true);
@@ -106,7 +116,40 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
     public override void Update()
     {
         wait.Update();
+        if (combatLog.DamageTaken.Count > 1)
+        {
+            // multiple mobs hitting us
+            // bail
+            Console.WriteLine("Multiple mob hits!");
+            Console.WriteLine(safeLocations.Count);
+            CancellationToken token = new CancellationToken();
+            if (safeLocations.Count > 1)
+            {
+                float heading = DirectionCalculator.CalculateMapHeading(playerReader.MapPos, (Vector3)safeLocations.ToArray()[1]);
+                safeLocations.Dequeue();
+                safeLocations.Dequeue();
+                input.PressClearTarget();
+                Console.WriteLine("Running away!");
+                float diff1 = Abs(Tau + heading - playerReader.Direction) % Tau;
+                float diff2 = Abs(heading - playerReader.Direction - Tau) % Tau;
+                float diff = Min(diff1, diff2);
+                if (diff > minAngleToTurn)
+                {
+                    if (diff > minAngleToStopBeforeTurn)
+                    {
+                        stopMoving.Stop();
+                    }
 
+                    ConsoleKey directionKey = (Tau + heading - playerReader.Direction) % Tau < PI
+            ? input.TurnLeftKey : input.TurnRightKey;
+                    float result = (Tau + heading - playerReader.Direction) % Tau;
+                    float amount = result > PI ? Tau - result : result;
+                    int duration = (int)(amount * 1000 / PI);
+                    input.PressFixed(directionKey, duration, token);
+                    input.PressFixed(ConsoleKey.W, 11_000, token);
+                }
+            }
+        }
         if (MathF.Abs(lastDirection - playerReader.Direction) > MathF.PI / 2)
         {
             logger.LogInformation("Turning too fast!");
@@ -125,6 +168,29 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
 
         if (bits.Target())
         {
+            if (bits.Target_Dead())
+            {
+                Console.WriteLine("Target Dead -- saving safe pos");
+                if (LastSafeLocationTime == DateTime.MinValue)
+                {
+                    LastSafeLocationTime = DateTime.UtcNow;
+                    safeLocations.Enqueue(playerReader.MapPos);
+                }
+                else
+                {
+                    if ((DateTime.UtcNow - LastSafeLocationTime).TotalMilliseconds > 5_000 && !bits.Combat())
+                    {
+                        safeLocations.Enqueue(playerReader.MapPos);
+                        LastSafeLocationTime = DateTime.UtcNow;
+                        if (safeLocations.Count > 5)
+                        {
+                            safeLocations.Dequeue();
+                        }
+                    }
+                }
+                logger.LogWarning("---- Target dead, clearing");
+                input.PressClearTarget();
+            }
             if (classConfig.AutoPetAttack &&
                 bits.Pet() &&
                 (!playerReader.PetTarget() || playerReader.PetTargetGuid != playerReader.TargetGuid) &&
@@ -161,6 +227,28 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
             {
                 stopMoving.Stop();
                 FindNewTarget();
+            } else
+            {
+                Console.WriteLine("Target Dead -- saving safe pos");
+                Console.WriteLine(bits.Combat());
+                if (LastSafeLocationTime == DateTime.MinValue)
+                {
+                    LastSafeLocationTime = DateTime.UtcNow;
+                }
+                else
+                {
+                    if ((DateTime.UtcNow - LastSafeLocationTime).TotalMilliseconds > 4_000)
+                    {
+                        safeLocations.Enqueue(playerReader.MapPos);
+                        LastSafeLocationTime = DateTime.UtcNow;
+                        if (safeLocations.Count > 5)
+                        {
+                            safeLocations.Dequeue();
+                        }
+                    }
+                }
+                logger.LogWarning("---- Target dead, clearing");
+                input.PressClearTarget();
             }
         }
     }
