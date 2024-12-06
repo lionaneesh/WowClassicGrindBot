@@ -1,4 +1,4 @@
-using Core.GOAP;
+﻿using Core.GOAP;
 
 using Microsoft.Extensions.Logging;
 using SharpDX.WIC;
@@ -8,7 +8,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Threading;
+using System.Drawing;
 using static System.MathF;
+using SixLabors.ImageSharp.Formats;
 
 namespace Core.Goals;
 
@@ -45,14 +47,12 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
     {
         this.logger = logger;
         this.input = input;
-        this.runningAway = false;
 
         this.wait = wait;
         this.playerReader = playerReader;
         this.bits = bits;
         this.combatLog = combatLog;
         this.playerNavigation = playerNavigation;
-        playerNavigation.OnWayPointReached += Flee_SafePointReached;
         this.stopMoving = stopMoving;
         this.castingHandler = castingHandler;
         this.mountHandler = mountHandler;
@@ -118,49 +118,7 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
     public override void Update()
     {
         wait.Update();
-        if (runningAway)
-        {
-            if (!bits.Combat())
-            {
-                runningAway = false;
-                Console.WriteLine("NO longer in combat. We are safe!");
-                safeLocations.AddLast(playerReader.MapPos);
-                playerNavigation.Stop();
-            }
-            else
-            {
-                Console.WriteLine("Still running!");
-                input.PressClearTarget();
-                playerNavigation.Update();
-                return;
-            }
-        }
-        if (combatLog.DamageTaken.Count > 1)
-        {
-            // multiple mobs hitting us
-            // bail
-            Console.WriteLine("Multiple mob hits!");
-            Console.WriteLine(safeLocations.Count);
-            CancellationToken token = new CancellationToken();
-            if (safeLocations.Count >= 1)
-            {
-                runningAway = true;
-                Console.WriteLine("Current Pos: " + playerReader.MapPos.ToString());
-                Console.WriteLine("Last safe: " + safeLocations.Last().ToString());
-                playerNavigation.SetWayPoints(stackalloc Vector3[] { (Vector3)(safeLocations.Last()) });
-                safeLocations.RemoveLast();
-                input.PressClearTarget();
-                Console.WriteLine("Running away to the last safe point!");
-            } else
-            {
-                Console.WriteLine("No safe points to run, just fight!");
-            }
-        }
-        if (MathF.Abs(lastDirection - playerReader.Direction) > MathF.PI / 2)
-        {
-            logger.LogInformation("Turning too fast!");
-            stopMoving.Stop();
-        }
+        playerNavigation.Update();
 
         lastDirection = playerReader.Direction;
         lastMinDistance = playerReader.MinRange();
@@ -172,12 +130,57 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
             return;
         }
 
+        if ((MathF.Abs(lastDirection - playerReader.Direction) > MathF.PI / 2))
+        {
+            logger.LogInformation("Turning too fast!");
+            stopMoving.Stop();
+
+        }
+        if (bits.Target() && !bits.Target_Alive())
+        {
+            input.PressClearTarget();
+            return;
+        }
+
+        if (combatLog.DamageTaken.Count > 1 || (playerReader.HealthPercent() < 50 && playerReader.ManaPercent() < 20) || (playerReader.HealthPercent() < 30))
+        {
+            // multiple mobs hitting us
+            // bail
+            Console.WriteLine("Multiple mob hits! OR HP and mana low");
+            Console.WriteLine(safeLocations.Count);
+            if (safeLocations.Count >= 1)
+            {
+                bool foundPoint = false;
+                Console.WriteLine("Current Pos: " + playerReader.MapPos.ToString());
+                Console.WriteLine("Safe Spots: " + safeLocations.Count);
+                for (LinkedListNode<Vector3> point = safeLocations.Last; point != null; point = point.Previous)
+                {
+                    Vector2 p1 = new Vector2(point.Value.X, point.Value.Y);
+                    Vector2 p2 = new Vector2(playerReader.MapPos.X, playerReader.MapPos.Y);
+                    if (Vector2.Distance(p1, p2) >= 1.8)
+                    {
+                        // select the point far enough to lose the current mobs.
+                        input.PressClearTarget();
+                        playerNavigation.Stop();
+                        playerNavigation.StuckResetTimeout = 500;
+                        playerNavigation.ResetStuckParameters();
+                        playerNavigation.SetWayPoints(stackalloc Vector3[] { (Vector3)(point.Value) });
+                        playerNavigation.Update();
+                        Console.WriteLine("Found point " + point.Value.ToString());
+                        foundPoint = true;
+                        break;
+                    }
+                }
+                if (foundPoint)
+                {
+                    Console.WriteLine("Running away to the last safe point!");
+                    return;
+                }
+            }
+        }
+
         if (bits.Target())
         {
-            if (bits.Target_Dead())
-            {
-                input.PressClearTarget();
-            }
             if (classConfig.AutoPetAttack &&
                 bits.Pet() &&
                 (!playerReader.PetTarget() || playerReader.PetTargetGuid != playerReader.TargetGuid) &&
@@ -216,6 +219,23 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
                 FindNewTarget();
             } else
             {
+                if (LastSafeLocationTime == DateTime.MinValue)
+                {
+                    LastSafeLocationTime = DateTime.UtcNow;
+                    safeLocations.AddLast(playerReader.MapPos);
+                }
+                else
+                {
+                    if ((DateTime.UtcNow - LastSafeLocationTime).TotalMilliseconds > 7_000 && !bits.Combat())
+                    {
+                        safeLocations.AddLast(playerReader.MapPos);
+                        LastSafeLocationTime = DateTime.UtcNow;
+                        if (safeLocations.Count > 100)
+                        {
+                            safeLocations.RemoveFirst();
+                        }
+                    }
+                }
                 Console.WriteLine("Target Dead2 -- saving safe pos " + playerReader.MapPos.ToString());
                 safeLocations.AddLast(playerReader.MapPos);
                 logger.LogWarning("---- Target dead, clearing");
@@ -224,29 +244,9 @@ public sealed class CombatGoal : GoapGoal, IGoapEventListener
         }
     }
 
-    private void Flee_SafePointReached()
-    {
-        Console.WriteLine("Safepoint reached, checking if combat cleared?");
-        if (!bits.Combat()) {
-            Console.WriteLine("We are safe!");
-            runningAway = false;
-        } else
-        {
-            Console.WriteLine("Still not safe, run to next safepoint!");
-            if (safeLocations.Count >= 1)
-            {
-                playerNavigation.SetWayPoints(stackalloc Vector3[] { (Vector3)(safeLocations.Last()) });
-                input.PressClearTarget();
-            } else
-            {
-                Console.WriteLine("No more safepoints, Fight back!");
-                runningAway = false;
-                playerNavigation.Stop();
-            }
-        }
-    }
     private void FindNewTarget()
     {
+        playerNavigation.Stop();
         if (playerReader.PetTarget() && combatLog.DeadGuid.Value != playerReader.PetTargetGuid)
         {
             ResetCooldowns();
